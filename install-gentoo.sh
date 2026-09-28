@@ -45,7 +45,7 @@ PORTAGE_ARCH="default/linux/amd64"
 HW_PROFILE="uefi"
 JOBS=""
 PART_TABLE="gpt"
-BOOT_TYPE="UESP"
+BOOT_TYPE="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
 BOOT_NAME="esp"
 BOOT_MOUNT="/boot/efi"
 BOOT_FSTYPE="vfat"
@@ -541,6 +541,7 @@ setup_portage() {
         plan "write make.conf and resolve the base Portage profile (binhost=$USE_BINHOST)"
         return 0
     fi
+    mkdir -p "$TARGET/etc/portage"
     {
         echo "# Written by install-gentoo.sh"
         echo "MAKEOPTS=\"-j${JOBS:-$(nproc)}\""
@@ -555,9 +556,19 @@ setup_portage() {
             echo "FEATURES=\"getbinpkg binpkg-request-signature\""
             echo "BINHOST=\"$BINHOST\""
         fi
+        # grub-install needs to be told which platform to target, and this is a
+        # make.conf variable, not a USE flag: the old "bios"/"efi" flags are
+        # gone from modern sys-boot/grub, which uses a grub_platforms
+        # USE_EXPAND fed by this variable. The amd64 profile does set a
+        # default, but a BIOS live environment can build a different one, so
+        # set it explicitly rather than inherit and hope.
+        if [[ "$HW_PROFILE" == bios ]]; then
+            echo 'GRUB_PLATFORMS="pc"'
+        else
+            echo 'GRUB_PLATFORMS="efi-64"'
+        fi
     } > "$TARGET/etc/portage/make.conf"
 
-    mkdir -p "$TARGET/etc/portage"
     # Portage 3.0.8x reads these as single files; a leftover *directory* of the
     # same name is silently ignored, which quietly voids every entry.
     rm -rf "$TARGET/etc/portage/package.use" "$TARGET/etc/portage/package.mask"
@@ -568,10 +579,6 @@ setup_portage() {
     # wpa_supplicant's dbus support needs a session bus that OpenRC has no
     # equivalent of; NetworkManager talks to it over the socket anyway.
     echo "net-misc/wpa_supplicant -dbus" >> "$TARGET/etc/portage/package.use"
-    if [[ "$HW_PROFILE" == bios ]]; then
-        # grub-install --target=i386-pc is only available with USE=bios.
-        echo "sys-boot/grub bios" >> "$TARGET/etc/portage/package.use"
-    fi
     ok "Portage configured (${USE_BINHOST:+binhost enabled}${USE_BINHOST:-source only})"
 }
 
@@ -646,6 +653,12 @@ install_packages() {
         app-misc/pciutils
         sys-apps/usbutils
     )
+    if [[ "$HW_PROFILE" == uefi ]]; then
+        # UEFI only: this is what writes the boot entry into firmware NVRAM.
+        # The BIOS profile writes its boot record straight to the MBR and
+        # never consults it.
+        pkgs+=(sys-boot/efibootmgr)
+    fi
     if ((DRY_RUN)); then
         plan "emerge --update --deep --newuse --autounmask-write @world"
         plan "emerge --oneshot: ${pkgs[*]}"
@@ -786,9 +799,24 @@ EOS
 
 install_bootloader() {
     if [[ "$HW_PROFILE" == uefi ]]; then
-        in_chroot_script <<'EOS'
+        # Unquoted heredoc: $DISK has to come from here. Anything meant for the
+        # target is escaped, including the loader path, whose backslashes must
+        # survive intact.
+        in_chroot_script <<EOS
 grub-install --target=x86-64-efi --efi-directory=/boot/efi \
              --bootloader-id=Gentoo --recheck
+# Register the loader in firmware NVRAM. Without an entry, OVMF and several
+# firmwares find nothing bootable and sit at a boot menu instead. efivarfs is
+# already there because the live environment is itself UEFI-booted.
+esp_part=\$(findmnt -n -o PARTN /boot/efi 2>/dev/null || echo 1)
+efibootmgr --create --disk $DISK --part "\$esp_part" --label Gentoo \
+           --loader '\EFI\Gentoo\grubx64.efi' \
+    || echo "WARNING: could not create the NVRAM boot entry"
+# Also write the removable path, EFI/BOOT/BOOTX64.EFI. Cheap insurance for
+# firmware that only scans that location. It would clobber a Windows loader,
+# but these machines are single-boot, and leaving firmware unable to find GRUB
+# is a worse outcome.
+grub-install --target=x86-64-efi --efi-directory=/boot/efi --removable --recheck
 grub-mkconfig -o /boot/grub/grub.cfg
 EOS
     else
@@ -800,6 +828,13 @@ EOS
 grub-install --target=i386-pc --recheck $DISK
 grub-mkconfig -o /boot/grub/grub.cfg
 EOS
+    fi
+    # An empty grub.cfg is the silent way to end up unbootable: grub-mkconfig
+    # still exits 0 and GRUB still boots, it just has no kernel to run.
+    if ! in_chroot "grep -qE '^menuentry' /boot/grub/grub.cfg" 2>/dev/null; then
+        warn "grub.cfg contains no menu entries."
+        warn "The kernel may not be installed under /boot. Do not reboot until"
+        warn "this is resolved, or you will land in a firmware boot menu."
     fi
     ok "GRUB installed ($HW_PROFILE)"
 }
