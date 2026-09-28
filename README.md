@@ -1,23 +1,42 @@
 # Barebones unattended Gentoo installer
 
 One script that installs Gentoo on a laptop from a live Linux environment, with
-no questions asked and no GUI. UEFI + GPT, no encryption, OpenRC, and a binary
-Gentoo kernel, so you end up with a console, `sshd`, and `doas` on a system you
-can trust before adding anything to it.
+no questions asked and no GUI. No encryption, OpenRC, and a binary Gentoo
+kernel, so you end up with a console, `sshd`, and `doas` on a system you can
+trust before adding anything to it.
 
-Written for a **ThinkPad L14 Gen 2** (UEFI; MediaTek MT7921 or Intel AX201
-wireless).
+## Two machines
 
-## Use
+| | `build.sh` | `build-k53e.sh` |
+| --- | --- | --- |
+| Machine | ThinkPad L14 Gen 2 | ASUS K53E |
+| Firmware | UEFI | legacy BIOS only |
+| Partition table | GPT, 512M ESP | MBR, 512M FAT32 `/boot` |
+| Boot partition | `/boot/efi` (vfat, type UESP) | `/boot` (vfat, type 83, bootable) |
+| GRUB | `--target=x86-64-efi` | `--target=i386-pc`, writes the MBR |
+| Secure Boot | must be **off** | n/a, it has none |
+| Build jobs | `nproc` | 2 (4 GB of RAM) |
 
 ```sh
 git clone <this repo> && cd gentoo-barebones-installer
 
+./build.sh      --auto --dry-run     # ThinkPad
+./build-k53e.sh --auto --dry-run     # K53E
+```
+
+Both are thin wrappers over `install-gentoo.sh --profile uefi|bios`. Everything
+that differs between the two machines lives in one `apply_profile` function, so
+there is a single code path rather than two scripts that drift apart. Use
+`--profile` directly if you want a different machine.
+
+## Use
+
+```sh
 # 1. always look before you leap
-./install-gentoo.sh --auto --dry-run
+./build.sh --auto --dry-run
 
 # 2. commit
-./install-gentoo.sh --auto
+./build.sh --auto
 ```
 
 ## What to boot
@@ -78,7 +97,8 @@ confirmation, and it is the point of no return.
 ## What you get
 
 ```
-disk    GPT:  esp 512M (vfat, /boot/efi) | swap 8G | root = rest (ext4, /)
+disk    uefi: GPT, esp 512M -> /boot/efi | bios: MBR, 512M -> /boot
+        swap 8G | root = rest (ext4, /), all referenced by LABEL in fstab
 kernel  sys-kernel/gentoo-kernel-bin  (dist kernel, no compiling)
 init    OpenRC. systemd is explicitly masked via USE.
 boot    GRUB, installed to the ESP, one menu entry "Gentoo"
@@ -122,16 +142,46 @@ The `doas` configuration, `fstab`, `OpenRC` service lists, and Portage config
 are all ports of code that is running on the Gentoo VM this was extracted from,
 where those parts *are* verified.
 
-**Not tested.** Everything that needs root and a real disk: `sfdisk`,
-`mkfs`, `grub-install`, the stage3 download and unpack, and `emerge`. The
-partition-table script is standard `sfdisk` input (ESP by size, swap by size,
-last partition takes the rest) but has not been run against a disk.
+**Not tested.** Everything that needs root and a real disk: `sfdisk`, `mkfs`,
+`grub-install`, the stage3 download and unpack, and `emerge`, for **both**
+profiles. The partition tables are standard `sfdisk` input and are printed by
+`--dry-run` for review, but neither has been written to an actual disk. The BIOS
+profile in particular has never been installed anywhere; treat it as untested
+and keep a live USB ready.
 
 So: run `--dry-run` first, and have a live USB ready to boot back into if
 anything goes wrong. If it fails, the log is at the path printed at the end, and
 `/tmp/install-gentoo-*.log` from the run.
 
-## Notes for this hardware
+## Notes for the ASUS K53E
+
+- **No UEFI.** Legacy AMI BIOS, last firmware revision 221 in October 2012. That
+  is the whole reason there is a second profile: no ESP, no NVRAM boot entry,
+  and GRUB has to go into the master boot record. Do not look for a UEFI
+  setting in the BIOS, there is not one.
+- **Intel HD 3000** has no usable 3D driver, which is part of why this build is
+  console-only. `i915`/`i965` will give you a framebuffer if you later want
+  X11, just not anything accelerated.
+- **Wireless is one of two chips**, depending on how it was configured:
+  Atheros AR9485/AR9462 (`ath9k`, driver built in, no firmware files needed) or
+  Intel Centrino Wireless-N 1000/1030 (`iwlwifi`, firmware from
+  `sys-firmware/linux-firmware`). Both are in the kernel, so nothing extra to
+  set up beyond the firmware package already installed.
+- **Wired is Realtek RTL8168/8111** on `r8169`, built into the kernel.
+- **Audio is a Realtek ALC269-series HDA codec** on `snd_hda_intel`. Nothing is
+  configured in a console-only install; see the note below if you add ALSA.
+- **`--jobs 2`, not `nproc`.** 4 GB of RAM on a 2c/4t part, and letting `-j`
+  equal the thread count is enough to get the compiler OOM-killed on the heavier
+  packages. Raise it with `--jobs N` if you have added RAM.
+- **Suspend can be odd on this series.** If S3 resume misbehaves (or the
+  touchpad dies after resuming), `acpi_osi="Windows 2006"` on the kernel
+  command line is the commonly cited workaround. I have not tested this.
+- **Do not flash the BIOS.** 221 from 2012 is final; there is nothing to gain
+  and bricking a 15-year-old board is a bad trade.
+- The disk may still have the factory recovery partition on it. That is
+  irrelevant here because the whole table is rewritten.
+
+## Notes for the ThinkPad L14 Gen 2
 
 - **Secure Boot must be off.** The kernel installed here is unsigned. On a
   ThinkPad: F1 at power-on, then Config → Security → Secure Boot → Disabled. The

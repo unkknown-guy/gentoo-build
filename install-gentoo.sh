@@ -12,7 +12,10 @@
 #   ./install-gentoo.sh --disk /dev/<whole-disk> --dry-run
 #   ./install-gentoo.sh --auto
 #
-# Written for a ThinkPad L14 Gen 2 (UEFI; MediaTek MT7921 or Intel AX201).
+# Two hardware profiles:
+#   uefi  ThinkPad L14 Gen 2 -- GPT + ESP at /boot/efi + GRUB for x86-64-efi
+#   bios  ASUS K53E          -- MBR + FAT32 /boot     + GRUB for i386-pc
+# build.sh and build-k53e.sh select one; --profile overrides.
 #
 set -euo pipefail
 
@@ -33,6 +36,24 @@ DISK=""
 AUTO_DISK=0
 SWAP_SIZE="8G"
 ESP_SIZE="512M"
+# Selected explicitly: the report used to print a $PROFILE that was never even
+# assigned, and inheriting whatever stage3 defaults to is not something to
+# leave to chance. "default" is a symlink that tracks the current release.
+PORTAGE_PROFILE="default/linux/amd64"
+# "uefi" = GPT + ESP at /boot/efi + GRUB for x86-64-efi (ThinkPad L14 Gen 2).
+# "bios" = MBR + plain FAT32 /boot + GRUB for i386-pc (ASUS K53E, legacy AMI
+# BIOS, no UEFI at all). Every difference between the two lives in here.
+HW_PROFILE="uefi"
+JOBS=""
+PART_TABLE="gpt"
+BOOT_TYPE="UESP"
+BOOT_NAME="esp"
+BOOT_MOUNT="/boot/efi"
+BOOT_FSTYPE="vfat"
+GRUB_TARGET="x86-64-efi"
+NEED_UEFI=1
+NEED_SECUREBOOT=1
+BOOTABLE_FLAG=""
 DRY_RUN=0
 ASSUME_YES=0
 USE_BINHOST=1
@@ -82,6 +103,8 @@ Barebones unattended Gentoo installer (UEFI/GPT, OpenRC, no GUI)
   --swap SIZE       default: $SWAP_SIZE
   --no-swap         do not create a swap partition
   --no-binhost      compile everything from source (hours instead of ~20 min)
+  --profile P       uefi (GPT + ESP + GRUB-UEFI) or bios (MBR + /boot + GRUB-BIOS)
+  --jobs N          parallel build jobs (default: nproc; lower it on small RAM)
   --dry-run         print the plan and change nothing
   --yes             skip the destructive confirmation prompt
   -h, --help        this text
@@ -103,6 +126,8 @@ while (( $# )); do
         --swap)       SWAP_SIZE="${2:?}"; shift 2 ;;
         --no-swap)    SWAP_SIZE=""; shift ;;
         --no-binhost) USE_BINHOST=0; shift ;;
+        --profile)    HW_PROFILE="${2:?uefi or bios}"; shift 2 ;;
+        --jobs)       JOBS="${2:?parallel build jobs}"; shift 2 ;;
         --dry-run)    DRY_RUN=1; shift ;;
         --yes|-y)     ASSUME_YES=1; shift ;;
         -h|--help)    usage; exit 0 ;;
@@ -160,6 +185,16 @@ require_live_network() {
 }
 
 check_uefi() {
+    (( NEED_UEFI )) || {
+        if [[ -d /sys/firmware/efi ]]; then
+            warn "this live system booted in UEFI mode, but --profile=bios
+    installs a legacy BIOS bootloader. The installed system must then be
+    booted in legacy/CSM-off mode, or it will not find GRUB."
+        else
+            ok "booted in legacy BIOS mode"
+        fi
+        return 0
+    }
     [[ -d /sys/firmware/efi ]] && { ok "booted in UEFI mode"; return 0; }
     die "this machine booted in legacy BIOS/CSM mode, which this script does not support.
     Reboot into UEFI and try again. On a ThinkPad: press F1 at power-on, then
@@ -167,6 +202,7 @@ check_uefi() {
 }
 
 check_secure_boot() {
+    (( NEED_SECUREBOOT )) || return 0   # legacy BIOS has no Secure Boot
     command -v efi-readvar >/dev/null 2>&1 || return 0
     if efi-readvar SecureBoot 2>/dev/null | grep -qi enabled; then
         warn "Secure Boot is ENABLED. The kernel installed here is unsigned and will not boot."
@@ -252,6 +288,28 @@ live_system_disk() {
     return 0
 }
 
+# Apply a profile. Called once from main, before anything reads these values.
+apply_profile() {
+    case "$HW_PROFILE" in
+        uefi)
+            PART_TABLE="gpt";      BOOT_TYPE="UESP"; BOOT_NAME="esp"
+            BOOT_MOUNT="/boot/efi"; BOOT_FSTYPE="vfat"
+            GRUB_TARGET="x86-64-efi"
+            NEED_UEFI=1; NEED_SECUREBOOT=1; BOOTABLE_FLAG=""
+            ;;
+        bios)
+            # No UEFI on this machine, so there is no EFI System Partition and
+            # nothing to register in NVRAM. /boot is an ordinary FAT32 primary
+            # partition of Linux type 83, flagged bootable.
+            PART_TABLE="dos";     BOOT_TYPE="83";   BOOT_NAME="boot"
+            BOOT_MOUNT="/boot";   BOOT_FSTYPE="vfat"
+            GRUB_TARGET="i386-pc"
+            NEED_UEFI=0; NEED_SECUREBOOT=0; BOOTABLE_FLAG=", bootable"
+            ;;
+        *) die "unknown --profile '$HW_PROFILE' (expected: uefi or bios)" ;;
+    esac
+}
+
 # ------------------------------------------------------------------ layout ---
 part_label() {
     lsblk -nrpo NAME,PARTLABEL "$DISK" 2>/dev/null | awk -v w="$1" '$2==w {print $1; exit}'
@@ -259,26 +317,36 @@ part_label() {
 
 show_layout() {
     local swap="${SWAP_SIZE:-none}"
-    cat <<EOF
+    if [[ "$HW_PROFILE" == uefi ]]; then
+        cat <<EOF
   disk    : $DISK
   table   : GPT
   esp     : ${ESP_SIZE}  fat32  -> /boot/efi
   swap    : ${swap}
   root    : remainder ext4  -> /
 EOF
+    else
+        cat <<EOF
+  disk    : $DISK
+  table   : MBR (msdos)
+  boot    : ${ESP_SIZE}  fat32  -> /boot   (type 83, bootable)
+  swap    : ${swap}
+  root    : remainder ext4  -> /
+EOF
+    fi
 }
 
 # sfdisk sizes accept suffixes (512M, 8G). The last partition takes the rest.
 write_partitions() {
     local script
     if [[ -n "$SWAP_SIZE" ]]; then
-        script="label: gpt
-start=1MiB, size=${ESP_SIZE}, type=UESP, name=esp
+        script="label: $PART_TABLE
+start=1MiB, size=${ESP_SIZE}, type=$BOOT_TYPE, name=$BOOT_NAME$BOOTABLE_FLAG
 size=${SWAP_SIZE}, type=swap, name=swap
 type=linux, name=root"
     else
-        script="label: gpt
-start=1MiB, size=${ESP_SIZE}, type=UESP, name=esp
+        script="label: $PART_TABLE
+start=1MiB, size=${ESP_SIZE}, type=$BOOT_TYPE, name=$BOOT_NAME$BOOTABLE_FLAG
 type=linux, name=root"
     fi
     if ((DRY_RUN)); then
@@ -286,21 +354,21 @@ type=linux, name=root"
         printf '%s\n' "$script" | sed 's/^/           /'
         return 0
     fi
-    sfdisk --wipe always --label gpt "$DISK" <<<"$script"
+    sfdisk --wipe always --label "$PART_TABLE" "$DISK" <<<"$script"
     partprobe "$DISK" || true
     udevadm settle 2>/dev/null || sleep 2
 }
 
 format_partitions() {
     local esp root swap
-    esp=$(part_label esp)
+    esp=$(part_label "$BOOT_NAME")
     root=$(part_label root)
     swap=$(part_label swap || true)
-    [[ -n "$esp"  ]] || die "could not find the esp partition (sfdisk did not label it)"
+    [[ -n "$esp"  ]] || die "could not find the $BOOT_NAME partition (sfdisk did not label it)"
     [[ -n "$root" ]] || die "could not find the root partition"
 
     info "formatting: $esp (fat32), $root (ext4)${swap:+, $swap (swap)}"
-    mkfs.vfat -F32 -n esp "$esp"  >/dev/null
+    mkfs.vfat -F32 -n "$BOOT_NAME" "$esp"  >/dev/null
     mkfs.ext4 -q -L root "$root"
     [[ -z "$swap" ]] || mkswap -L swap "$swap" >/dev/null
     ok "formatted"
@@ -314,12 +382,15 @@ format_partitions() {
 
 mount_targets() {
     local esp swap
-    esp=$(part_label esp)
+    esp=$(part_label "$BOOT_NAME")
     swap=$(part_label swap || true)
-    info "mounting /boot/efi and the pseudo-filesystems"
-    mkdir -p "$TARGET/boot/efi" "$TARGET/proc" "$TARGET/sys" "$TARGET/dev"
-    mount -t vfat "$esp" "$TARGET/boot/efi"
+    [[ -n "$esp" ]] || die "could not find the $BOOT_NAME partition"
+
+    mkdir -p "$TARGET$BOOT_MOUNT" "$TARGET/proc" "$TARGET/sys" "$TARGET/dev"
+    info "mounting $BOOT_MOUNT and the pseudo-filesystems"
+    mount -t vfat "$esp" "$TARGET$BOOT_MOUNT"
     [[ -z "$swap" ]] || swapon "$swap"
+    local m
     for m in proc sys dev; do
         mount --rbind "/$m" "$TARGET/$m"
         mount --make-rslave "$TARGET/$m" 2>/dev/null || true
@@ -394,12 +465,12 @@ in_chroot_script() {
 # ------------------------------------------------------------------ portage ---
 setup_portage() {
     if ((DRY_RUN)); then
-        plan "write /etc/portage/make.conf (profile $PROFILE, binhost=$USE_BINHOST)"
+        plan "select Portage profile $PORTAGE_PROFILE and write make.conf (binhost=$USE_BINHOST)"
         return 0
     fi
     {
         echo "# Written by install-gentoo.sh"
-        echo "MAKEOPTS=\"-j$(nproc)\""
+        echo "MAKEOPTS=\"-j${JOBS:-$(nproc)}\""
         echo "EMERGE_DEFAULT_OPTS=\"--backtrack=5 --autounmask-write\""
         echo "ACCEPT_LICENSE=\"*\""
         # OpenRC, not systemd. -consolekit because OpenRC uses seatd/logind-free
@@ -424,7 +495,24 @@ setup_portage() {
     # wpa_supplicant's dbus support needs a session bus that OpenRC has no
     # equivalent of; NetworkManager talks to it over the socket anyway.
     echo "net-misc/wpa_supplicant -dbus" >> "$TARGET/etc/portage/package.use"
+    if [[ "$HW_PROFILE" == bios ]]; then
+        # grub-install --target=i386-pc is only available with USE=bios.
+        echo "sys-boot/grub bios" >> "$TARGET/etc/portage/package.use"
+    fi
     ok "Portage configured (${USE_BINHOST:+binhost enabled}${USE_BINHOST:-source only})"
+}
+
+# The profile symlink has to be set inside the target, and only after the tree
+# is synced: eselect resolves "default/linux/amd64" against the profiles that
+# actually exist, and on a freshly unpacked stage3 that tree is empty.
+select_profile() {
+    if ((DRY_RUN)); then
+        plan "select Portage profile $PORTAGE_PROFILE"
+        return 0
+    fi
+    in_chroot "eselect profile set $PORTAGE_PROFILE" \
+        || die "could not select Portage profile $PORTAGE_PROFILE"
+    ok "Portage profile: $PORTAGE_PROFILE"
 }
 
 sync_portage() {
@@ -489,7 +577,7 @@ EOF
     # booting. pass=2 would try to fsck vfat, which is meaningless.
     cat > "$TARGET/etc/fstab" <<EOF
 # <file system>   <mount point>  <type>  <options>               <dump> <pass>
-LABEL=esp         /boot/efi       vfat   defaults,noatime        0      2
+LABEL=$BOOT_NAME         $BOOT_MOUNT       $BOOT_FSTYPE   defaults,noatime        0      0
 $( [[ -n "$SWAP_SIZE" ]] && echo "LABEL=swap        none            swap   sw,noatime              0      0" )
 LABEL=root        /               ext4   defaults,noatime        0      1
 tmpfs             /tmp            tmpfs  rw,nosuid,nodev,size=2G  0      0
@@ -598,12 +686,23 @@ EOS
 }
 
 install_bootloader() {
-    in_chroot_script <<'EOS'
-# GRUB for UEFI
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Gentoo --recheck
+    if [[ "$HW_PROFILE" == uefi ]]; then
+        in_chroot_script <<'EOS'
+grub-install --target=x86-64-efi --efi-directory=/boot/efi \
+             --bootloader-id=Gentoo --recheck
 grub-mkconfig -o /boot/grub/grub.cfg
 EOS
-    ok "GRUB installed"
+    else
+        # BIOS target. grub-install writes a boot record to the whole disk
+        # (the MBR) and stages GRUB under /boot/grub, which is already the
+        # FAT32 partition mounted above. No --efi-directory, no NVRAM entry:
+        # there is no UEFI firmware to register anything with.
+        in_chroot_script <<EOS
+grub-install --target=i386-pc --recheck $DISK
+grub-mkconfig -o /boot/grub/grub.cfg
+EOS
+    fi
+    ok "GRUB installed ($HW_PROFILE)"
 }
 
 finalize() {
@@ -645,19 +744,29 @@ EOF
 }
 
 dry_run_report() {
+    local partline bootline bl
+    if [[ "$HW_PROFILE" == uefi ]]; then
+        partline="GPT on $DISK"
+        bootline="esp ${ESP_SIZE} -> /boot/efi (vfat)"
+        bl="grub-install --target=x86-64-efi --efi-directory=/boot/efi"
+    else
+        partline="MBR/msdos on $DISK"
+        bootline="boot ${ESP_SIZE} -> /boot (fat32, type 83, bootable)"
+        bl="grub-install --target=i386-pc $DISK  (writes the master boot record)"
+    fi
     cat <<EOF
 
   plan
   ----
-  partition : GPT on $DISK
-              esp ${ESP_SIZE} -> /boot/efi (vfat)
+  partition : $partline
+              $bootline
               ${SWAP_SIZE:+swap ${SWAP_SIZE}; }root = remainder -> / (ext4)
   stage3    : latest from the first reachable mirror
-  portage   : profile $PROFILE, $( ((USE_BINHOST)) && echo "binary packages (binhost)" || echo "source only, expect hours")
+  portage   : profile $PORTAGE_PROFILE, $( ((USE_BINHOST)) && echo "binary packages (binhost)" || echo "source only, expect hours")
   packages  : @world + kernel/grub/NetworkManager/wpa_supplicant/doas/openssh
               + acpid/power-profiles/chrony + firmware + vim/git/pciutils/usbutils
   services  : net + NetworkManager + sshd + acpid + power-profiles + chronyd
-  bootloader: grub-install --target=x86_64-efi
+  bootloader: $bl
   user      : $USERNAME (wheel,audio,video,usb,plugdev), root + $USERNAME share a password
 
 EOF
@@ -667,6 +776,7 @@ EOF
 main() {
     local esp root
 
+    apply_profile
     need_tools
     if (( !DRY_RUN )); then
         (( EUID == 0 )) || die "must run as root (try: sudo ./install-gentoo.sh)"
@@ -744,6 +854,7 @@ main() {
 
     setup_portage
     sync_portage
+    select_profile
     install_packages
 
     base_config
