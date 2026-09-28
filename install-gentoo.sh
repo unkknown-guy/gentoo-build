@@ -173,7 +173,7 @@ EOF
 require_live_network() {
     command -v ip >/dev/null 2>&1 || command -v ifconfig >/dev/null 2>&1 || return 0
     local ifaces up
-    ifaces=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$')
+    ifaces=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' || true)
     [[ -n "$ifaces" ]] || die "no network interface found, only loopback.
     If this live ISO needs networking configured by hand, do it now, e.g.:
       Gentoo:  ip link set up eth0 && dhcpcd eth0
@@ -242,7 +242,7 @@ list_candidate_disks() {
 
 auto_pick_disk() {
     local d
-    d=$(list_candidate_disks | head -1)
+    d=$(list_candidate_disks | head -1 || true)
     [[ -n "$d" ]] || die "--auto found no candidate disk.
     Only unmounted, non-removable whole disks qualify (a live USB is excluded).
     Run 'lsblk' and pass one explicitly with --disk."
@@ -272,7 +272,7 @@ live_system_disk() {
     local src pk
 
     # findmnt gives a real path but may carry a btrfs subvolume suffix.
-    src=$(findmnt -no SOURCE / 2>/dev/null | head -1)
+    src=$(findmnt -no SOURCE / 2>/dev/null | head -1 || true)
     src="${src%%[*}"
     if [[ -z "$src" || "$src" == overlay* || ! -e "$src" ]]; then
         src=$(sed -n 's/.*[^a-z]root=\([^ ]*\).*/\1/p' /proc/cmdline 2>/dev/null | head -1)
@@ -280,7 +280,7 @@ live_system_disk() {
     fi
     [[ -n "$src" && -e "$src" ]] || return 0
 
-    pk=$(lsblk -nrpo PKNAME "$src" 2>/dev/null | head -1 | tr -d ' ')
+    pk=$(lsblk -nrpo PKNAME "$src" 2>/dev/null | head -1 | tr -d ' ' || true)
     if [[ -n "$pk" ]]; then
         # util-linux >= 2.33 already reports PKNAME as a full path.
         [[ "$pk" == /* ]] || pk="/dev/$pk"
@@ -296,7 +296,11 @@ live_system_disk() {
 apply_profile() {
     case "$HW_PROFILE" in
         uefi)
-            PART_TABLE="gpt";      BOOT_TYPE="UESP"; BOOT_NAME="esp"
+            # The raw ESP GUID, not the name "UESP": minimal live ISOs often
+            # ship no partition type list, and an unresolvable name makes
+            # sfdisk write the GPT and then fail to add partition 1.
+            PART_TABLE="gpt";      BOOT_TYPE="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"
+            BOOT_NAME="esp"
             BOOT_MOUNT="/boot/efi"; BOOT_FSTYPE="vfat"
             GRUB_TARGET="x86-64-efi"
             NEED_UEFI=1; NEED_SECUREBOOT=1; BOOTABLE_FLAG=""
@@ -316,7 +320,7 @@ apply_profile() {
 
 # ------------------------------------------------------------------ layout ---
 part_label() {
-    lsblk -nrpo NAME,PARTLABEL "$DISK" 2>/dev/null | awk -v w="$1" '$2==w {print $1; exit}'
+    lsblk -nrpo NAME,PARTLABEL "$DISK" 2>/dev/null | awk -v w="$1" '$2==w {print $1; exit}' || true
 }
 
 show_layout() {
@@ -340,6 +344,36 @@ EOF
     fi
 }
 
+# Run the exact partition script against a throwaway sparse image first. This
+# costs nothing (sparse files allocate nothing) and catches an entire class of
+# failure -- unresolvable type names, geometry that does not fit, a typo in a
+# label -- before a single sector of the real disk is touched. Without it, a
+# bad script writes the table and then dies, leaving you with a wiped disk and
+# no partitions. The scratch image is the size of the real disk, capped, so a
+# target that is simply too small fails here too.
+validate_partition_script() {
+    local script="$1" img sz out rc=0
+    sz=$(blockdev --getsize64 "$DISK" 2>/dev/null || echo 0)
+    (( sz > 0 )) || sz=$((32 * 1024 * 1024 * 1024))
+    (( sz > 64 * 1024 * 1024 * 1024 )) && sz=$((64 * 1024 * 1024 * 1024))
+    img=$(mktemp "${TMPDIR:-/tmp}/gbi-sfdisk-test.XXXXXX") || {
+        warn "could not create a scratch file; skipping partition table validation"
+        return 0; }
+    truncate -s "$sz" "$img" 2>/dev/null || truncate -s 1G "$img"
+    rc=0
+    out=$(sfdisk --quiet --label "$PART_TABLE" "$img" <<<"$script" 2>&1) || rc=$?
+    rm -f "$img"
+    if (( rc == 0 )); then
+        ok "partition table validated on a ${sz}-byte scratch image"
+        return 0
+    fi
+    printf '%s\n' "$out" >&2
+    die "the partition script is not valid for a $((sz / 1024 / 1024 / 1024))G disk.
+  Nothing has been written to $DISK. The error from sfdisk is above; if it
+  says 'Failed to add #1 partition', the live system has no partition type
+  list, which means type= names will not resolve. Use raw type GUIDs."
+}
+
 # sfdisk sizes accept suffixes (512M, 8G). The last partition takes the rest.
 write_partitions() {
     local script
@@ -356,8 +390,11 @@ type=linux, name=root"
     if ((DRY_RUN)); then
         plan "wipe $DISK and write this partition table:"
         printf '%s\n' "$script" | sed 's/^/           /'
-        return 0
+    else
+        printf '%s\n' "$script" | sed 's/^/           /'
     fi
+    validate_partition_script "$script"
+    ((DRY_RUN)) && return 0
     sfdisk --wipe always --label "$PART_TABLE" "$DISK" <<<"$script"
 
     # Make the new partitions actually appear. partprobe alone is not enough:
@@ -639,7 +676,7 @@ make_user() {
     # Write the password file on the host and chpasswd inside the chroot, so no
     # password ever appears in this script's output or in a log.
     local tmppw
-    tmppw=$(mktemp)
+    tmppw=$(mktemp) || die "could not create a temporary file for the password"
     chmod 600 "$tmppw"
     printf '%s:%s\n' "$USERNAME" "$PASSWORD" > "$tmppw"
     printf 'root:%s\n' "$PASSWORD" >> "$tmppw"
@@ -833,7 +870,7 @@ main() {
     if [[ -z "$DISK" ]]; then
         if (( !AUTO_DISK )); then
             local hint
-            hint=$(list_candidate_disks | head -1)
+            hint=$(list_candidate_disks | head -1 || true)
             die "no target disk. Use --auto, or --disk with a whole device${hint:+ (candidates: $(list_candidate_disks | tr '\n' ' '))}."
         fi
         DISK="$(auto_pick_disk)"
@@ -850,7 +887,7 @@ main() {
     fi
 
     # Refuse a partition: a partition table has to go on a whole disk.
-    dtype=$(lsblk -dnpo TYPE "$DISK" 2>/dev/null | head -1 | tr -d " ")
+    dtype=$(lsblk -dnpo TYPE "$DISK" 2>/dev/null | head -1 | tr -d " " || true)
     [[ "$dtype" == "disk" ]] || die "$DISK is a '$dtype', not a whole disk.
     Install to the whole disk, without a partition suffix (p1, s1, part1, ...)."
 
