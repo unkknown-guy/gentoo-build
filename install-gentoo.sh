@@ -36,10 +36,9 @@ DISK=""
 AUTO_DISK=0
 SWAP_SIZE="8G"
 ESP_SIZE="512M"
-# Selected explicitly: the report used to print a $PROFILE that was never even
-# assigned, and inheriting whatever stage3 defaults to is not something to
-# leave to chance. "default" is a symlink that tracks the current release.
-PORTAGE_PROFILE="default/linux/amd64"
+# The base profile is resolved at install time from "eselect profile list",
+# because the release suffix changes. This is the arch half, for the regex.
+PORTAGE_ARCH="default/linux/amd64"
 # "uefi" = GPT + ESP at /boot/efi + GRUB for x86-64-efi (ThinkPad L14 Gen 2).
 # "bios" = MBR + plain FAT32 /boot + GRUB for i386-pc (ASUS K53E, legacy AMI
 # BIOS, no UEFI at all). Every difference between the two lives in here.
@@ -539,7 +538,7 @@ in_chroot_script() {
 # ------------------------------------------------------------------ portage ---
 setup_portage() {
     if ((DRY_RUN)); then
-        plan "select Portage profile $PORTAGE_PROFILE and write make.conf (binhost=$USE_BINHOST)"
+        plan "write make.conf and resolve the base Portage profile (binhost=$USE_BINHOST)"
         return 0
     fi
     {
@@ -579,14 +578,40 @@ setup_portage() {
 # The profile symlink has to be set inside the target, and only after the tree
 # is synced: eselect resolves "default/linux/amd64" against the profiles that
 # actually exist, and on a freshly unpacked stage3 that tree is empty.
+# Parse the plain base profile out of "eselect profile list". eselect wants a
+# concrete profile such as default/linux/amd64/23.0, not the default/linux/amd64
+# symlink, and the release suffix moves over time, so ask rather than guess.
+# Whole-field anchored, so a desktop variant is never mistaken for the base.
+resolve_portage_profile() {
+    local arch="${PORTAGE_ARCH:-default/linux/amd64}"
+    # Match a whole whitespace-delimited field, anchored at both ends. A
+    # substring match would happily return "default/linux/amd64/23.0" out of
+    # "default/linux/amd64/23.0/desktop" and select a desktop profile.
+    printf '%s\n' "$1" \
+        | awk -v a="$arch" '{ for (i=1;i<=NF;i++)
+                if ($i ~ "^" a "/[0-9][0-9.]*[0-9]$") { print $i; exit } }' || true
+}
+
 select_profile() {
     if ((DRY_RUN)); then
-        plan "select Portage profile $PORTAGE_PROFILE"
+        plan "select the base Portage profile for this release (default/linux/amd64/<release>)"
         return 0
     fi
-    in_chroot "eselect profile set $PORTAGE_PROFILE" \
-        || die "could not select Portage profile $PORTAGE_PROFILE"
-    ok "Portage profile: $PORTAGE_PROFILE"
+    local list target
+    list=$(in_chroot "eselect profile list 2>/dev/null" || true)
+    target=$(resolve_portage_profile "$list")
+    if [[ -z "$target" ]]; then
+        # Not fatal. stage3 already ships the correct base profile selected, so
+        # carrying on is strictly better than dying over a cosmetic step.
+        warn "could not resolve a base Portage profile from eselect;
+    keeping the one stage3 shipped with"
+        return 0
+    fi
+    if in_chroot "eselect profile set $target"; then
+        ok "Portage profile: $target"
+    else
+        warn "eselect refused profile $target; keeping the stage3 default"
+    fi
 }
 
 sync_portage() {
@@ -836,7 +861,7 @@ dry_run_report() {
               $bootline
               ${SWAP_SIZE:+swap ${SWAP_SIZE}; }root = remainder -> / (ext4)
   stage3    : latest from the first reachable mirror
-  portage   : profile $PORTAGE_PROFILE, $( ((USE_BINHOST)) && echo "binary packages (binhost)" || echo "source only, expect hours")
+  portage   : $PORTAGE_ARCH/<release> (resolved from eselect), $( ((USE_BINHOST)) && echo "binary packages (binhost)" || echo "source only, expect hours")
   packages  : @world + kernel/grub/NetworkManager/wpa_supplicant/doas/openssh
               + acpid/power-profiles/chrony + firmware + vim/git/pciutils/usbutils
   services  : net + NetworkManager + sshd + acpid + power-profiles + chronyd
