@@ -578,7 +578,7 @@ setup_portage() {
     echo "sys-kernel/installkernel dracut" >> "$TARGET/etc/portage/package.use"
     # wpa_supplicant's dbus support needs a session bus that OpenRC has no
     # equivalent of; NetworkManager talks to it over the socket anyway.
-    echo "net-misc/wpa_supplicant -dbus" >> "$TARGET/etc/portage/package.use"
+    echo "net-wireless/wpa_supplicant -dbus" >> "$TARGET/etc/portage/package.use"
     ok "Portage configured (${USE_BINHOST:+binhost enabled}${USE_BINHOST:-source only})"
 }
 
@@ -634,23 +634,25 @@ install_packages() {
         sys-boot/grub
         # networking
         net-misc/networkmanager
-        net-misc/wpa_supplicant
+        net-wireless/wpa_supplicant
         # access
         app-admin/doas
         net-misc/openssh
         # laptop hardware
-        sys-apps/acpid                    # lid switch, power button, brightness keys
-        app-power/power-profiles-daemon    # on battery vs plugged in
-        # firmware: L14 Gen 2 ships MT7921 (MediaTek) or Intel AX201
-        sys-firmware/linux-firmware
-        sys-firmware/intel-firmware
-        sys-firmware/mediatek-firmware
+        sys-power/acpid                    # lid switch, power button, brightness keys
+        sys-power/power-profiles-daemon    # on battery vs plugged in
+        # firmware: L14 Gen 2 ships MT7921 (MediaTek) or Intel AX201. The
+        # intel-firmware and mediatek-firmware atoms no longer exist; those
+        # blobs ship in the consolidated linux-firmware package now, which
+        # itself moved from sys-firmware to sys-kernel.
+        sys-kernel/linux-firmware
+        sys-firmware/intel-microcode       # CPU microcode
         sys-firmware/sof-firmware          # Intel SoF audio
         # odds and ends
-        app-misc/chrony                    # clock; TLS and logs need it right
+        net-misc/chrony                    # clock; TLS and logs need it right
         app-editors/vim
         dev-vcs/git
-        app-misc/pciutils
+        sys-apps/pciutils
         sys-apps/usbutils
     )
     if [[ "$HW_PROFILE" == uefi ]]; then
@@ -784,16 +786,41 @@ options iwlwifi power_save=0 d0_timeout=100
 # MediaTek MT7921 (L14 Gen 2, types 20X1/20X2/20X5/20X6)
 options mt7921e power_save=0
 CONF
-# A hand-connect fallback if NetworkManager has not come up yet.
+# NetworkManager owns wireless here, and it does NOT read this file: it keeps
+# its own connections in /etc/NetworkManager/system-connections/. The old note
+# telling you to append a passphrase here was a dead end -- nothing on this
+# system ever read it, so following it produced a machine with no wifi and no
+# obvious reason why.
 mkdir -p /etc/wpa_supplicant
 chmod 700 /etc/wpa_supplicant
 cat > /etc/wpa_supplicant/wpa_supplicant.conf <<'CONF'
-# Fill this in on first boot if you need to connect without NetworkManager:
-#   wpa_passphrase "YOUR-SSID" >> /etc/wpa_supplicant/wpa_supplicant.conf
-# then chmod 600 the file and:  wpa_cli reconfigure
+# Only used by the standalone wpa_supplicant service, which is NOT enabled.
+# Wireless is configured through NetworkManager; run /root/wifi-setup for that.
 country=US
 CONF
 chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+
+# A one-shot helper for the first boot, since the SSID and passphrase are not
+# known at install time. It goes through nmcli, which is the interface
+# NetworkManager actually reads back.
+cat > /root/wifi-setup <<'SETUP'
+#!/usr/bin/env bash
+# Join a wireless network. Run as root:  /root/wifi-setup
+set -euo pipefail
+echo "Scanning..."
+nmcli --wait 20 device wifi list || true
+read -rp "SSID: " ssid
+read -rsp "Passphrase (blank for open): " pass; echo
+if [[ -n "$pass" ]]; then
+    nmcli connection add type wifi ifname wlan0 con-name "$ssid" ssid "$ssid"
+    nmcli connection modify "$ssid" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$pass"
+else
+    nmcli connection add type wifi ifname wlan0 con-name "$ssid" ssid "$ssid"
+fi
+nmcli connection up "$ssid"
+echo "Connected as: $ssid"
+SETUP
+chmod 700 /root/wifi-setup
 EOS
 }
 
