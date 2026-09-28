@@ -114,7 +114,7 @@ done
 need_tools() {
     local missing=() t
     for t in sfdisk mkfs.ext4 mkfs.vfat mkswap tar xz curl partprobe \
-             mount umount chroot git blkid lsblk; do
+             mount umount chroot lsblk; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
     ((${#missing[@]})) || return 0
@@ -122,12 +122,41 @@ need_tools() {
 
 missing tools: ${missing[*]}
 
-  Gentoo live ISO:  emerge ${missing[*]}
-  Debian/Ubuntu:    apt install gdisk dosfstools e2fsprogs util-linux curl git
-  Fedora:           dnf install util-linux dosfstools e2fsprogs curl git
+  Gentoo live ISO:  emerge sys-apps/util-linux sys-fs/dosfstools sys-fs/e2fsprogs \\\
+                    net-misc/curl app-arch/xz-utils
+  Arch:             pacman -S util-linux dosfstools e2fsprogs curl xz
+  Debian/Ubuntu:    apt install fdisk util-linux mount dosfstools e2fsprogs \\\
+                    curl xz-utils
+  Fedora:           dnf install util-linux dosfstools e2fsprogs curl xz
+  openSUSE:         zypper install util-linux dosfstools e2fsprogs curl xz
+
+  (mkfs.vfat comes from dosfstools, sfdisk from fdisk/util-linux, xz from
+   xz-utils/xz. Every mainstream live ISO already has all of them.)
 
 EOF
     die "install the tools above and re-run"
+}
+
+# The live system has to already have working internet: this script downloads
+# stage3, the Portage snapshot and every package. It deliberately does not try
+# to configure networking for you, because doing it wrong on a live system is
+# easy and a half-configured interface mid-install is worse than a clear error.
+require_live_network() {
+    command -v ip >/dev/null 2>&1 || command -v ifconfig >/dev/null 2>&1 || return 0
+    local ifaces up
+    ifaces=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$')
+    [[ -n "$ifaces" ]] || die "no network interface found, only loopback.
+    If this live ISO needs networking configured by hand, do it now, e.g.:
+      Gentoo:  ip link set up eth0 && dhcpcd eth0
+      Arch:    ip link set up eth0 && dhcpcd
+      Debian:  ip link set up eth0 && dhcpcd   (or: ifup eth0)"
+    up=""
+    local i
+    for i in $ifaces; do
+        [[ "$(cat "/sys/class/net/$i/operstate" 2>/dev/null)" == up ]] && up="$up $i"
+    done
+    [[ -n "$up" ]] || die "no network interface is up ($ifaces found).
+    Bring one up before running, e.g. 'ip link set up eth0 && dhcpcd eth0'."
 }
 
 check_uefi() {
@@ -645,6 +674,7 @@ main() {
     fi
     check_uefi
     check_secure_boot
+    require_live_network
 
     if [[ -z "$DISK" ]]; then
         if (( !AUTO_DISK )); then

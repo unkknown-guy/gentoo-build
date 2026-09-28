@@ -20,10 +20,44 @@ git clone <this repo> && cd gentoo-barebones-installer
 ./install-gentoo.sh --auto
 ```
 
-Boot a live USB (any distro), open a terminal, `su -` or `sudo -i`, and run it.
-You need working internet: Portage downloads the tree and packages.
+## What to boot
 
-It will ask for one password, which is used for both your user and root, and
+**Any Linux live ISO.** The script downloads its own stage3, so the ISO's
+Gentoo is irrelevant — an Arch or Ubuntu stick works exactly as well as
+`install-amd64-minimal.iso`. You need three things:
+
+1. **UEFI boot.** Not CSM/legacy. The script checks `/sys/firmware/efi` and
+   stops with an explanation if the firmware booted it the old way.
+2. **Root** — `su -` or `sudo -i`.
+3. **These tools**, which every mainstream ISO already has:
+   `sfdisk mkfs.ext4 mkfs.vfat mkswap tar xz curl partprobe mount umount chroot lsblk`
+
+If something is missing the script tells you the install command for your
+distro (Gentoo, Arch, Debian/Ubuntu, Fedora, openSUSE) and stops.
+
+**Bring networking up first.** This is the usual stumbling block: the script
+downloads stage3, the Portage snapshot and every package, and it deliberately
+does *not* configure networking for you. On an ISO that does it for you, ignore
+this. On Gentoo's minimal ISO, Arch, or anything else that starts with no
+address, do it first:
+
+```sh
+ip link                                  # find the interface name
+ip link set up eth0 && dhcpcd eth0       # or: ifup eth0 / udhcpc -i eth0
+ping -c1 distfiles.gentoo.org            # sanity check
+```
+
+The script refuses to start if nothing is up, and prints that same hint, rather
+than failing 20 minutes into a download.
+
+Then, as root:
+
+```sh
+./install-gentoo.sh --auto --dry-run     # 1. look before you leap
+./install-gentoo.sh --auto               # 2. commit
+```
+
+It asks for one password, which is used for both your user and root, and
 then it wants you to type the device path to confirm. That is the only
 confirmation, and it is the point of no return.
 
