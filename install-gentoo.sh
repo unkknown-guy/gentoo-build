@@ -359,8 +359,41 @@ type=linux, name=root"
         return 0
     fi
     sfdisk --wipe always --label "$PART_TABLE" "$DISK" <<<"$script"
-    partprobe "$DISK" || true
-    udevadm settle 2>/dev/null || sleep 2
+
+    # Make the new partitions actually appear. partprobe alone is not enough:
+    # on virtio it usually cannot re-read the table, and on some USB bridges
+    # and card readers it returns "device busy". Both leave the partition
+    # device nodes missing, which surfaces much later as a confusing
+    # "could not find the esp partition". Try each mechanism, then wait.
+    partprobe "$DISK" 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
+    partx --update "$DISK" 2>/dev/null || true
+    blockdev --rereadpt "$DISK" 2>/dev/null || true
+    udevadm trigger --subsystem-match=block "$DISK" 2>/dev/null || true
+    udevadm settle 2>/dev/null || true
+    wait_for_partitions
+}
+
+# Poll until the boot and root partitions are visible, or give up with enough
+# context to diagnose it. Device node creation is async, so a fixed sleep is
+# both too slow on a fast disk and too short on a slow one.
+wait_for_partitions() {
+    local i boot root
+    for ((i = 0; i < 30; i++)); do
+        boot=$(part_label "$BOOT_NAME")
+        root=$(part_label root)
+        if [[ -n "$boot" && -n "$root" && -b "$boot" && -b "$root" ]]; then
+            ok "partitions visible (${boot}, ${root})"
+            return 0
+        fi
+        sleep 1
+    done
+    lsblk -o NAME,TYPE,SIZE,FSTYPE,PARTLABEL "$DISK" >&2 || true
+    die "the new partitions on $DISK never appeared.
+  sfdisk wrote the table (see above), but the kernel has not created the
+  partition devices. This usually means the bus cannot re-read the table.
+  Try, in order: partx --update $DISK ; blockdev --rereadpt $DISK ;
+  or reboot from the live USB again and rerun."
 }
 
 format_partitions() {
