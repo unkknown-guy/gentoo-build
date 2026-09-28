@@ -24,14 +24,14 @@ Boot a live USB (any distro), open a terminal, `su -` or `sudo -i`, and run it.
 You need working internet: Portage downloads the tree and packages.
 
 It will ask for one password, which is used for both your user and root, and
-then it wants you to type the device path (`/dev/nvme0n1`) to confirm. That is
-the only confirmation, and it is the point of no return.
+then it wants you to type the device path to confirm. That is the only
+confirmation, and it is the point of no return.
 
 ### Options
 
 | Flag | Meaning |
 | --- | --- |
-| `--disk DEVICE` | target disk, e.g. `/dev/nvme0n1` |
+| `--disk DEVICE` | target whole disk, e.g. `/dev/nvme0n1` or `/dev/sda` |
 | `--auto` | largest unmounted non-removable disk |
 | `--hostname NAME` | default `gentoo-laptop` |
 | `--user NAME` | default `gentoo` |
@@ -72,6 +72,14 @@ rm -f /path/to/install-gentoo.sh      # so it cannot run twice
 ## What is verified, and what is not
 
 Being straight about this, because you are about to erase a laptop:
+
+**Finding the right disk.** Run `lsblk` first. Names differ by machine —
+`/dev/nvme0n1` (NVMe), `/dev/sda` (SATA), `/dev/mmcblk0` (eMMC) — so the script
+reads the device list out of `lsblk` instead of assuming any of them, and
+`--auto` shows you the candidates it considered. It refuses a partition (you
+would be writing a partition table into a slice of a disk) and refuses the disk
+the live system is currently booted from, so pointing it at the wrong machine
+or the wrong drive fails instead of erasing something.
 
 **Tested.** `bash -n` syntax. `--help`. A full `--dry-run` against a machine with
 a real NVMe: it correctly selected the largest unmounted non-removable disk,

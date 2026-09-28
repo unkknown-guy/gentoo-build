@@ -9,7 +9,7 @@
 # Run it from a live Linux environment (any distribution) that can see the
 # target disk. It erases the target disk.
 #
-#   ./install-gentoo.sh --disk /dev/nvme0n1 --dry-run
+#   ./install-gentoo.sh --disk /dev/<whole-disk> --dry-run
 #   ./install-gentoo.sh --auto
 #
 # Written for a ThinkPad L14 Gen 2 (UEFI; MediaTek MT7921 or Intel AX201).
@@ -73,7 +73,8 @@ usage() {
     cat <<EOF
 Barebones unattended Gentoo installer (UEFI/GPT, OpenRC, no GUI)
 
-  --disk DEVICE     target disk, e.g. /dev/nvme0n1 (erased)
+  --disk DEVICE     target whole disk, e.g. /dev/nvme0n1 or /dev/sda (erased)
+                    run "lsblk" first; partitions and live media are refused
   --auto            pick the largest unmounted non-removable disk
   --hostname NAME   default: $HOSTNAME
   --user NAME       default: $USERNAME
@@ -157,18 +158,69 @@ check_network() {
     die "no mirror reachable. Portage needs the internet; check the connection."
 }
 
-auto_pick_disk() {
-    local d
-    # type=disk, not removable, has no mounted partitions.
-    d=$(lsblk -dnpo NAME,TYPE,RM,MOUNTPOINT 2>/dev/null \
+# Every whole disk that qualifies as a target: not removable, nothing mounted
+# on it. Deliberately works off lsblk's NAME column rather than assuming a
+# /dev/nvme0n1 or /dev/sda layout, so it behaves the same on NVMe, SATA, USB
+# and eMMC. Ordered largest first.
+list_candidate_disks() {
+    lsblk -dnpo NAME,TYPE,RM,MOUNTPOINT 2>/dev/null \
         | awk '$2=="disk" && $3=="0" && $4=="" {print $1}' \
         | while read -r dev; do
               printf '%s %s\n' "$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)" "$dev"
           done \
-        | sort -rn | head -1 | cut -d' ' -f2)
+        | sort -rn | cut -d' ' -f2
+}
+
+auto_pick_disk() {
+    local d
+    d=$(list_candidate_disks | head -1)
     [[ -n "$d" ]] || die "--auto found no candidate disk.
-    Only unmounted, non-removable block devices qualify. Use --disk to be explicit."
+    Only unmounted, non-removable whole disks qualify (a live USB is excluded).
+    Run 'lsblk' and pass one explicitly with --disk."
     printf '%s' "$d"
+}
+
+# Turn a root= token into a real /dev path. lsblk will not resolve "UUID=...",
+# and silently returning nothing here would disable the live-system guard
+# entirely, which is exactly the case that matters when booted from a USB.
+resolve_root_token() {
+    local tok="$1" p
+    case "$tok" in
+        /dev/*)    printf '%s' "$tok"; return 0 ;;
+        UUID=*)    p="/dev/disk/by-uuid/${tok#UUID=}" ;;
+        LABEL=*)   p="/dev/disk/by-label/${tok#LABEL=}" ;;
+        PARTUUID=*) p="/dev/disk/by-partuuid/${tok#PARTUUID=}" ;;
+        *)         return 1 ;;
+    esac
+    [[ -e "$p" ]] || return 1
+    readlink -f "$p"
+}
+
+# The whole disk the currently running system booted from, or empty if that
+# cannot be determined (an overlay-root live system has no backing device).
+# Used to refuse to erase the medium the installer is running from.
+live_system_disk() {
+    local src pk
+
+    # findmnt gives a real path but may carry a btrfs subvolume suffix.
+    src=$(findmnt -no SOURCE / 2>/dev/null | head -1)
+    src="${src%%[*}"
+    if [[ -z "$src" || "$src" == overlay* || ! -e "$src" ]]; then
+        src=$(sed -n 's/.*[^a-z]root=\([^ ]*\).*/\1/p' /proc/cmdline 2>/dev/null | head -1)
+        src=$(resolve_root_token "$src" 2>/dev/null) || src=""
+    fi
+    [[ -n "$src" && -e "$src" ]] || return 0
+
+    pk=$(lsblk -nrpo PKNAME "$src" 2>/dev/null | head -1 | tr -d ' ')
+    if [[ -n "$pk" ]]; then
+        # util-linux >= 2.33 already reports PKNAME as a full path.
+        [[ "$pk" == /* ]] || pk="/dev/$pk"
+        printf '%s' "$pk"
+    elif [[ "$(lsblk -dnpo TYPE "$src" 2>/dev/null | tr -d ' ')" == disk ]]; then
+        # root lives directly on a whole disk (no partition table)
+        printf '%s' "$src"
+    fi
+    return 0
 }
 
 # ------------------------------------------------------------------ layout ---
@@ -595,14 +647,39 @@ main() {
     check_secure_boot
 
     if [[ -z "$DISK" ]]; then
-        ((AUTO_DISK)) || die "no target disk. Use --disk /dev/nvme0n1, or --auto."
+        if (( !AUTO_DISK )); then
+            local hint
+            hint=$(list_candidate_disks | head -1)
+            die "no target disk. Use --auto, or --disk with a whole device${hint:+ (candidates: $(list_candidate_disks | tr '\n' ' '))}."
+        fi
         DISK="$(auto_pick_disk)"
     fi
-    if (( !DRY_RUN )); then
-        [[ -b "$DISK" ]] || die "$DISK is not a block device"
-        if lsblk -nrpo MOUNTPOINT "$DISK" 2>/dev/null | grep -q .; then
-            die "$DISK has a mounted partition. Unmount it first."
+    # Target validation is read-only, so it runs in --dry-run too: a dry run
+    # that green-lit a disk the real run would refuse is worse than no dry run.
+    local dtype live
+    if [[ ! -b "$DISK" ]]; then
+        if (( DRY_RUN )); then
+            die "$DISK is not a block device on this machine. Device names vary
+    (NVMe /dev/nvme0n1, SATA /dev/sda, eMMC /dev/mmcblk0) -- run 'lsblk'."
         fi
+        die "$DISK is not a block device. Run 'lsblk' to see the real device names."
+    fi
+
+    # Refuse a partition: a partition table has to go on a whole disk.
+    dtype=$(lsblk -dnpo TYPE "$DISK" 2>/dev/null | head -1 | tr -d " ")
+    [[ "$dtype" == "disk" ]] || die "$DISK is a '$dtype', not a whole disk.
+    Install to the whole disk, without a partition suffix (p1, s1, part1, ...)."
+
+    # Refuse the disk this live system is running from.
+    live=$(live_system_disk)
+    if [[ -n "$live" && "$live" == "$DISK" ]]; then
+        die "$DISK is the disk you are booted from.
+    Refusing to erase the running system. Boot the live USB from another device,
+    or pick a different --disk."
+    fi
+
+    if lsblk -nrpo MOUNTPOINT "$DISK" 2>/dev/null | grep -q .; then
+        die "$DISK has a mounted partition. Unmount it first."
     fi
 
     if [[ -z "$PASSWORD" ]]; then
