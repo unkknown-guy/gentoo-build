@@ -54,6 +54,7 @@ NEED_UEFI=1
 NEED_SECUREBOOT=1
 BOOTABLE_FLAG=""
 DRY_RUN=0
+RESUME=0
 ASSUME_YES=0
 USE_BINHOST=1
 
@@ -100,6 +101,10 @@ Barebones unattended Gentoo installer (UEFI/GPT, OpenRC, no GUI)
   --disk DEVICE     target whole disk, e.g. /dev/nvme0n1 or /dev/sda (erased)
                     run "lsblk" first; partitions and live media are refused
   --auto            pick the largest unmounted non-removable disk
+  --resume          continue a previous run: keep the existing partitions,
+                    stage3 and @world, and redo only what is missing.
+                    Use after a failure late in the install, so you do not
+                    pay for the whole thing twice.
   --hostname NAME   default: $HOSTNAME
   --user NAME       default: $USERNAME
   --password PW     password for the user and root; prompted for if omitted
@@ -122,6 +127,7 @@ EOF
 while (( $# )); do
     case "$1" in
         --disk)       DISK="${2:?}"; shift 2 ;;
+        --resume)     RESUME=1; shift ;;
         --auto)       AUTO_DISK=1; shift ;;
         --hostname)   HOSTNAME="${2:?}"; shift 2 ;;
         --user)       USERNAME="${2:?}"; shift 2 ;;
@@ -627,8 +633,12 @@ sync_portage() {
     ok "tree synced"
 }
 
-install_packages() {
-    local pkgs=(
+# The package set, resolved into a global so verify_atoms and the emerge
+# cannot drift apart. Kept as a function rather than a literal so --dry-run and
+# the real run always describe the same set.
+PKGS=()
+define_packages() {
+    PKGS=(
         # kernel and bootloader
         sys-kernel/gentoo-kernel-bin
         sys-boot/grub
@@ -659,18 +669,55 @@ install_packages() {
         # UEFI only: this is what writes the boot entry into firmware NVRAM.
         # The BIOS profile writes its boot record straight to the MBR and
         # never consults it.
-        pkgs+=(sys-boot/efibootmgr)
+        PKGS+=(sys-boot/efibootmgr)
     fi
+}
+
+# Every atom is checked against the tree that was just synced, before any
+# emerge runs. emerge aborts the entire set on the first unknown atom, so a
+# stale name here used to surface only after @world had been building for
+# half an hour. This checks all of them at once and names every offender.
+verify_atoms() {
+    local tree=/var/db/repos/gentoo
+    [[ -d "$TARGET$tree" ]] || tree=/usr/portage
+    [[ -d "$TARGET$tree" ]] || die "cannot find the Portage tree in the target"
+
+    local -a missing=()
+    local a
+    for a in "$@"; do
+        # Straight host-side test: $TARGET is an ordinary directory here, so a
+        # chroot would buy nothing and would make this untestable without root.
+        [[ -d "$TARGET$tree/${a%%/*}/${a#*/}" ]] || missing+=("$a")
+    done
+    if (( ${#missing[@]} )); then
+        printf '\n' >&2
+        printf 'These packages do not exist in the Portage tree:\n' >&2
+        printf '  %s\n' "${missing[@]}" >&2
+        printf '\nThey were renamed or removed upstream, so this version of the\n' >&2
+        printf 'installer is out of date. Nothing has been merged.\n' >&2
+        return 1
+    fi
+    ok "all ${#} package names verified against the Portage tree"
+}
+
+install_world() {
     if ((DRY_RUN)); then
         plan "emerge --update --deep --newuse --autounmask-write @world"
-        plan "emerge --oneshot: ${pkgs[*]}"
         return 0
     fi
     info "installing @world (binhost: ~20 min, source: hours)"
     in_chroot "emerge --update --deep --newuse --autounmask-write @world" >/dev/null
-    info "installing the laptop package set"
-    in_chroot "emerge --oneshot --noreplace --newuse --autounmask-write ${pkgs[*]}" >/dev/null
-    ok "packages installed"
+    ok "@world installed"
+}
+
+install_package_set() {
+    if ((DRY_RUN)); then
+        plan "emerge --oneshot: ${PKGS[*]}"
+        return 0
+    fi
+    info "installing the laptop package set (${#PKGS[@]} packages)"
+    in_chroot "emerge --oneshot --noreplace --newuse --autounmask-write ${PKGS[*]}" >/dev/null
+    ok "package set installed"
 }
 
 # ------------------------------------------------------------------- config ---
@@ -915,6 +962,7 @@ dry_run_report() {
         bootline="boot ${ESP_SIZE} -> /boot (fat32, type 83, bootable)"
         bl="grub-install --target=i386-pc $DISK  (writes the master boot record)"
     fi
+    define_packages
     cat <<EOF
 
   plan
@@ -924,8 +972,8 @@ dry_run_report() {
               ${SWAP_SIZE:+swap ${SWAP_SIZE}; }root = remainder -> / (ext4)
   stage3    : latest from the first reachable mirror
   portage   : $PORTAGE_ARCH/<release> (resolved from eselect), $( ((USE_BINHOST)) && echo "binary packages (binhost)" || echo "source only, expect hours")
-  packages  : @world + kernel/grub/NetworkManager/wpa_supplicant/doas/openssh
-              + acpid/power-profiles/chrony + firmware + vim/git/pciutils/usbutils
+  packages  : $( ((RESUME)) && echo "package set only (@world is already merged)" || echo "@world +" )
+              ${PKGS[*]}
   services  : net + NetworkManager + sshd + acpid + power-profiles + chronyd
   bootloader: $bl
   user      : $USERNAME (wheel,audio,video,usb,plugdev), root + $USERNAME share a password
@@ -1014,6 +1062,14 @@ main() {
     fi
 
     mkdir -p "$TARGET"
+    if ((RESUME)); then
+        # Everything already on disk is kept: no partitioning, no formatting,
+        # no re-download, no re-emerge of @world. The point is that one failure
+        # near the end should not cost another full run.
+        warn "RESUME: keeping the existing partitions, stage3 and @world."
+        [[ -b "$DISK" ]] || die "--resume needs a target disk to mount ($DISK)"
+        mount_targets
+    else
     write_partitions
     format_partitions
     download_and_unpack          # before mounting /boot/efi and /dev
@@ -1021,9 +1077,21 @@ main() {
     cp -L /etc/resolv.conf "$TARGET/etc/resolv.conf"
 
     setup_portage
-    sync_portage
+    # Before anything reads PKGS. Checking it first would verify an empty list
+    # and pass without having looked at a single package.
+    define_packages
+    if ((RESUME)); then
+        # The tree is already synced. Re-downloading a 200MB snapshot to
+        # validate the package names would be the slow part of a fast repair.
+        verify_atoms "${PKGS[@]}" \
+            || die "the installer is out of date; see the list above"
+    else
+        sync_portage
+    fi
     select_profile
-    install_packages
+    ((RESUME)) || install_world
+    install_package_set
+    fi
 
     base_config
     make_user
