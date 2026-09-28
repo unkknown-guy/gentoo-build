@@ -221,3 +221,26 @@ anything goes wrong. If it fails, the log is at the path printed at the end, and
   then removed. The VM installer that this came from had a bug where `passwd`
   printed a suggested password into the serial log; avoid that by not running
   `passwd` non-interactively at all.
+
+## If the machine boots to a firmware menu
+
+That is the signature of GRUB having been installed but never registered. Some
+revisions of the installer created `EFI/Gentoo/grubx64.efi` and stopped there.
+OVMF, and a number of real firmwares, fall back to scanning
+`EFI/BOOT/BOOTX64.EFI`; with neither an NVRAM entry nor that fallback, the
+install reports success and then finds nothing to boot.
+
+`reinstall-grub.sh` fixes an install that is already on disk. It mounts the
+existing target, runs `grub-install` plus `efibootmgr`, checks that
+`grub.cfg` has real menu entries, and unmounts. It never writes a partition
+table and never formats anything.
+
+```
+./reinstall-grub.sh --disk /dev/sda
+```
+
+It must be run from a live environment booted in UEFI mode; it refuses to run
+otherwise, because `efibootmgr` cannot write the boot entry without
+`efivarfs`. It also refuses to touch the disk the live system is booted from,
+and requires exactly one candidate disk if `--disk` is omitted.
+
