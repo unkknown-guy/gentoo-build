@@ -72,7 +72,11 @@ fi
 info() { printf '  %s\n' "$*"; }
 ok()   { printf '  %s%s%s\n' "$C_G" "$*" "$C_R"; }
 warn() { printf '  %s%s%s\n' "$C_Y" "$*" "$C_R"; }
-die()  { printf '\n%serror:%s %s\n' "$C_RD" "$C_R" "$*" >&2; exit 1; }
+die()  {
+    printf '\n%serror:%s %s\n' "$C_RD" "$C_R" "$*" >&2
+    [[ -n "${LOGFILE:-}" && -f "$LOGFILE" ]] && printf '  (full output: %s)\n' "$LOGFILE" >&2
+    exit 1
+}
 plan() { printf '  %swould:%s %s\n' "$C_Y" "$C_R" "$*"; }
 # run() makes the whole script safe to dry-run: it echoes instead of executing.
 run()  { if ((DRY_RUN)); then plan "$*"; else "$@"; fi; }
@@ -775,6 +779,13 @@ EOF
 
 main() {
     local esp root
+
+    # Everything from here on is teed to a log. Without this a failure halfway
+    # through an emerge is unrecoverable, because the console scrolled past and
+    # the exit code says nothing about which of 200 packages gave up.
+    LOGFILE="/tmp/install-gentoo-$(date +%Y%m%d-%H%M%S).log"
+    exec > >(tee -a "$LOGFILE") 2>&1
+    ok "logging to $LOGFILE"
 
     apply_profile
     need_tools
