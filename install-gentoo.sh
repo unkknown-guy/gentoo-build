@@ -1,0 +1,672 @@
+#!/usr/bin/env bash
+#
+# Unattended Gentoo installer for a barebones laptop.
+#
+# UEFI + GPT, no encryption, OpenRC, NetworkManager + wpa_supplicant, and a
+# binary Gentoo kernel. No graphical environment: console, sshd, and doas, so
+# you can build up from a known-good base.
+#
+# Run it from a live Linux environment (any distribution) that can see the
+# target disk. It erases the target disk.
+#
+#   ./install-gentoo.sh --disk /dev/nvme0n1 --dry-run
+#   ./install-gentoo.sh --auto
+#
+# Written for a ThinkPad L14 Gen 2 (UEFI; MediaTek MT7921 or Intel AX201).
+#
+set -euo pipefail
+
+# ------------------------------------------------------------------ config ---
+PROFILE="23.0"
+STAGE3_BASE="releases/amd64/autobuilds/current-stage3-amd64-openrc"
+MIRRORS=(
+    "https://distfiles.gentoo.org/pub/${STAGE3_BASE}"
+    "https://ftp.osuosl.org/pub/gentoo/${STAGE3_BASE}"
+)
+BINHOST="https://distfiles.gentoo.org/releases/amd64/binpackages/${PROFILE}/x86-64"
+PORTAGE_SNAPSHOT="https://distfiles.gentoo.org/snapshots/portage-latest.tar.xz"
+
+HOSTNAME="gentoo-laptop"
+USERNAME="gentoo"
+PASSWORD=""
+DISK=""
+AUTO_DISK=0
+SWAP_SIZE="8G"
+ESP_SIZE="512M"
+DRY_RUN=0
+ASSUME_YES=0
+USE_BINHOST=1
+
+TARGET="/mnt/gentoo"
+MOUNTED=0
+TARBALL=""
+
+# ------------------------------------------------------------------ output ---
+if [[ -t 1 ]]; then
+    C_B=$'\033[1m'; C_R=$'\033[0m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_RD=$'\033[31m'
+else
+    C_B=""; C_R=""; C_G=""; C_Y=""; C_RD=""
+fi
+
+info() { printf '  %s\n' "$*"; }
+ok()   { printf '  %s%s%s\n' "$C_G" "$*" "$C_R"; }
+warn() { printf '  %s%s%s\n' "$C_Y" "$*" "$C_R"; }
+die()  { printf '\n%serror:%s %s\n' "$C_RD" "$C_R" "$*" >&2; exit 1; }
+plan() { printf '  %swould:%s %s\n' "$C_Y" "$C_R" "$*"; }
+# run() makes the whole script safe to dry-run: it echoes instead of executing.
+run()  { if ((DRY_RUN)); then plan "$*"; else "$@"; fi; }
+
+cleanup() {
+    local rc=$?
+    if ((MOUNTED)); then
+        warn "unmounting after an error; the target is probably incomplete"
+        sync
+        umount -R "$TARGET" 2>/dev/null || true
+    fi
+    [[ -n "$TARBALL" && -f "$TARBALL" ]] && rm -f "$TARBALL"
+    return $rc
+}
+trap cleanup EXIT
+trap 'die "interrupted"' INT TERM
+
+usage() {
+    cat <<EOF
+Barebones unattended Gentoo installer (UEFI/GPT, OpenRC, no GUI)
+
+  --disk DEVICE     target disk, e.g. /dev/nvme0n1 (erased)
+  --auto            pick the largest unmounted non-removable disk
+  --hostname NAME   default: $HOSTNAME
+  --user NAME       default: $USERNAME
+  --password PW     password for the user and root; prompted for if omitted
+  --swap SIZE       default: $SWAP_SIZE
+  --no-swap         do not create a swap partition
+  --no-binhost      compile everything from source (hours instead of ~20 min)
+  --dry-run         print the plan and change nothing
+  --yes             skip the destructive confirmation prompt
+  -h, --help        this text
+
+Always dry-run first:
+
+  ./install-gentoo.sh --auto --dry-run
+EOF
+}
+
+# ------------------------------------------------------------------- args ---
+while (( $# )); do
+    case "$1" in
+        --disk)       DISK="${2:?}"; shift 2 ;;
+        --auto)       AUTO_DISK=1; shift ;;
+        --hostname)   HOSTNAME="${2:?}"; shift 2 ;;
+        --user)       USERNAME="${2:?}"; shift 2 ;;
+        --password)   PASSWORD="${2:?}"; shift 2 ;;
+        --swap)       SWAP_SIZE="${2:?}"; shift 2 ;;
+        --no-swap)    SWAP_SIZE=""; shift ;;
+        --no-binhost) USE_BINHOST=0; shift ;;
+        --dry-run)    DRY_RUN=1; shift ;;
+        --yes|-y)     ASSUME_YES=1; shift ;;
+        -h|--help)    usage; exit 0 ;;
+        *)            die "unknown option: $1   (see --help)" ;;
+    esac
+done
+
+# --------------------------------------------------------------- preflight ---
+need_tools() {
+    local missing=() t
+    for t in sfdisk mkfs.ext4 mkfs.vfat mkswap tar xz curl partprobe \
+             mount umount chroot git blkid lsblk; do
+        command -v "$t" >/dev/null 2>&1 || missing+=("$t")
+    done
+    ((${#missing[@]})) || return 0
+    cat >&2 <<EOF
+
+missing tools: ${missing[*]}
+
+  Gentoo live ISO:  emerge ${missing[*]}
+  Debian/Ubuntu:    apt install gdisk dosfstools e2fsprogs util-linux curl git
+  Fedora:           dnf install util-linux dosfstools e2fsprogs curl git
+
+EOF
+    die "install the tools above and re-run"
+}
+
+check_uefi() {
+    [[ -d /sys/firmware/efi ]] && { ok "booted in UEFI mode"; return 0; }
+    die "this machine booted in legacy BIOS/CSM mode, which this script does not support.
+    Reboot into UEFI and try again. On a ThinkPad: press F1 at power-on, then
+    Config -> Security -> Secure Boot -> Disabled, and set boot mode to UEFI only."
+}
+
+check_secure_boot() {
+    command -v efi-readvar >/dev/null 2>&1 || return 0
+    if efi-readvar SecureBoot 2>/dev/null | grep -qi enabled; then
+        warn "Secure Boot is ENABLED. The kernel installed here is unsigned and will not boot."
+        ((ASSUME_YES)) && { warn "continuing because --yes was given"; return 0; }
+        die "disable Secure Boot in the firmware setup, then re-run."
+    fi
+    return 0
+}
+
+check_network() {
+    local m
+    for m in "${MIRRORS[@]}"; do
+        if curl -sf --max-time 20 "$m/latest-stage3-amd64-openrc.txt" -o /dev/null 2>&1; then
+            ok "mirror reachable: $m"
+            return 0
+        fi
+    done
+    die "no mirror reachable. Portage needs the internet; check the connection."
+}
+
+auto_pick_disk() {
+    local d
+    # type=disk, not removable, has no mounted partitions.
+    d=$(lsblk -dnpo NAME,TYPE,RM,MOUNTPOINT 2>/dev/null \
+        | awk '$2=="disk" && $3=="0" && $4=="" {print $1}' \
+        | while read -r dev; do
+              printf '%s %s\n' "$(blockdev --getsize64 "$dev" 2>/dev/null || echo 0)" "$dev"
+          done \
+        | sort -rn | head -1 | cut -d' ' -f2)
+    [[ -n "$d" ]] || die "--auto found no candidate disk.
+    Only unmounted, non-removable block devices qualify. Use --disk to be explicit."
+    printf '%s' "$d"
+}
+
+# ------------------------------------------------------------------ layout ---
+part_label() {
+    lsblk -nrpo NAME,PARTLABEL "$DISK" 2>/dev/null | awk -v w="$1" '$2==w {print $1; exit}'
+}
+
+show_layout() {
+    local swap="${SWAP_SIZE:-none}"
+    cat <<EOF
+  disk    : $DISK
+  table   : GPT
+  esp     : ${ESP_SIZE}  fat32  -> /boot/efi
+  swap    : ${swap}
+  root    : remainder ext4  -> /
+EOF
+}
+
+# sfdisk sizes accept suffixes (512M, 8G). The last partition takes the rest.
+write_partitions() {
+    local script
+    if [[ -n "$SWAP_SIZE" ]]; then
+        script="label: gpt
+start=1MiB, size=${ESP_SIZE}, type=UESP, name=esp
+size=${SWAP_SIZE}, type=swap, name=swap
+type=linux, name=root"
+    else
+        script="label: gpt
+start=1MiB, size=${ESP_SIZE}, type=UESP, name=esp
+type=linux, name=root"
+    fi
+    if ((DRY_RUN)); then
+        plan "wipe $DISK and write this partition table:"
+        printf '%s\n' "$script" | sed 's/^/           /'
+        return 0
+    fi
+    sfdisk --wipe always --label gpt "$DISK" <<<"$script"
+    partprobe "$DISK" || true
+    udevadm settle 2>/dev/null || sleep 2
+}
+
+format_partitions() {
+    local esp root swap
+    esp=$(part_label esp)
+    root=$(part_label root)
+    swap=$(part_label swap || true)
+    [[ -n "$esp"  ]] || die "could not find the esp partition (sfdisk did not label it)"
+    [[ -n "$root" ]] || die "could not find the root partition"
+
+    info "formatting: $esp (fat32), $root (ext4)${swap:+, $swap (swap)}"
+    mkfs.vfat -F32 -n esp "$esp"  >/dev/null
+    mkfs.ext4 -q -L root "$root"
+    [[ -z "$swap" ]] || mkswap -L swap "$swap" >/dev/null
+    ok "formatted"
+
+    mount -t ext4 "$root" "$TARGET"
+    MOUNTED=1
+    # stage3 is unpacked *before* /boot/efi and the pseudo-filesystems are
+    # mounted: extracting over them would write into the ESP and the host's /dev.
+    return 0
+}
+
+mount_targets() {
+    local esp swap
+    esp=$(part_label esp)
+    swap=$(part_label swap || true)
+    info "mounting /boot/efi and the pseudo-filesystems"
+    mkdir -p "$TARGET/boot/efi" "$TARGET/proc" "$TARGET/sys" "$TARGET/dev"
+    mount -t vfat "$esp" "$TARGET/boot/efi"
+    [[ -z "$swap" ]] || swapon "$swap"
+    for m in proc sys dev; do
+        mount --rbind "/$m" "$TARGET/$m"
+        mount --make-rslave "$TARGET/$m" 2>/dev/null || true
+    done
+    ok "mounted at $TARGET"
+}
+
+# ------------------------------------------------------------------ stage3 ---
+fetch_stage3() {
+    local m name
+    for m in "${MIRRORS[@]}"; do
+        if curl -sf --max-time 30 "$m/latest-stage3-amd64-openrc.txt" -o /tmp/.stage3.ptr 2>/dev/null; then
+            # The pointer file is PGP-signed; the filename is the first
+            # non-comment, non-armour line.
+            name=$(awk '/^stage3-amd64-openrc-.*\.tar\.xz/ {print $1; exit}' /tmp/.stage3.ptr)
+            if [[ -n "$name" ]]; then
+                printf '%s\t%s' "$name" "$m"
+                return 0
+            fi
+        fi
+    done
+    die "could not determine the current stage3 filename from any mirror"
+}
+
+download_and_unpack() {
+    local pair name base tarball
+    pair=$(fetch_stage3)
+    name="${pair%%$'\t'*}"; base="${pair#*$'\t'}"
+    tarball="/tmp/$name"
+    TARBALL="$tarball"
+
+    info "downloading $name (about 280 MB)"
+    if ! run curl -fL --progress-bar -o "$tarball" "$base/$name"; then
+        return 0
+    fi
+    ok "downloaded"
+
+    info "unpacking stage3 into $TARGET"
+    # Modern stage3 tarballs extract straight into the target. A few wrap
+    # everything in one directory, so handle that shape too.
+    if ! run tar -xpf "$tarball" -C "$TARGET" --xattrs --xattrs-include='*' 2>/dev/null; then
+        if ! run tar -xpf "$tarball" -C "$TARGET"; then
+            die "could not unpack $name"
+        fi
+    fi
+    if [[ ! -d "$TARGET/etc" ]]; then
+        local inner
+        inner=$(find "$TARGET" -mindepth 1 -maxdepth 1 -type d | head -1)
+        [[ -n "$inner" && -d "$inner/etc" ]] || die "unexpected stage3 layout in $TARGET"
+        info "stage3 has a wrapping directory: $(basename "$inner")"
+        run sh -c "shopt -s dotglob; mv '$inner'/* '$TARGET'/; rmdir '$inner'"
+    fi
+    ok "stage3 unpacked"
+}
+
+# ------------------------------------------------------------------ chroot ---
+in_chroot() { chroot "$TARGET" /usr/bin/env bash -c "cd / && $1"; }
+# Feed a script (on stdin) into the chroot, with a readable failure message.
+in_chroot_script() {
+    local script name
+    script=$(cat)
+    name=$(printf '%s' "$script" | sed -n 's/^# *//p' | head -1)
+    if ((DRY_RUN)); then
+        plan "chroot step: ${name:-inline script}"
+        printf '%s\n' "$script" | sed 's/^/         /' | tail -n +2
+        return 0
+    fi
+    info "${name:-applying configuration}"
+    printf '%s\n' "$script" | in_chroot 'bash -s' >/dev/null
+}
+
+# ------------------------------------------------------------------ portage ---
+setup_portage() {
+    if ((DRY_RUN)); then
+        plan "write /etc/portage/make.conf (profile $PROFILE, binhost=$USE_BINHOST)"
+        return 0
+    fi
+    {
+        echo "# Written by install-gentoo.sh"
+        echo "MAKEOPTS=\"-j$(nproc)\""
+        echo "EMERGE_DEFAULT_OPTS=\"--backtrack=5 --autounmask-write\""
+        echo "ACCEPT_LICENSE=\"*\""
+        # OpenRC, not systemd. -consolekit because OpenRC uses seatd/logind-free
+        # sessions and consolekit pulls in a lot of dead machinery.
+        echo "USE=\"-systemd -systemd-units -systemd-login-session -systemd-timesyncd -consolekit\""
+        if ((USE_BINHOST)); then
+            # Prebuilt packages: this is the difference between ~20 minutes and
+            # many hours. Get it wrong and everything compiles from source.
+            echo "FEATURES=\"getbinpkg binpkg-request-signature\""
+            echo "BINHOST=\"$BINHOST\""
+        fi
+    } > "$TARGET/etc/portage/make.conf"
+
+    mkdir -p "$TARGET/etc/portage"
+    # Portage 3.0.8x reads these as single files; a leftover *directory* of the
+    # same name is silently ignored, which quietly voids every entry.
+    rm -rf "$TARGET/etc/portage/package.use" "$TARGET/etc/portage/package.mask"
+    : > "$TARGET/etc/portage/package.use"
+    : > "$TARGET/etc/portage/package.mask"
+    # installkernel needs dracut to build an initramfs for the binary kernel.
+    echo "sys-kernel/installkernel dracut" >> "$TARGET/etc/portage/package.use"
+    # wpa_supplicant's dbus support needs a session bus that OpenRC has no
+    # equivalent of; NetworkManager talks to it over the socket anyway.
+    echo "net-misc/wpa_supplicant -dbus" >> "$TARGET/etc/portage/package.use"
+    ok "Portage configured (${USE_BINHOST:+binhost enabled}${USE_BINHOST:-source only})"
+}
+
+sync_portage() {
+    info "syncing the Portage tree (a few hundred MB)"
+    run in_chroot "emerge --sync"
+    ok "tree synced"
+}
+
+install_packages() {
+    local pkgs=(
+        # kernel and bootloader
+        sys-kernel/gentoo-kernel-bin
+        sys-boot/grub
+        # networking
+        net-misc/networkmanager
+        net-misc/wpa_supplicant
+        # access
+        app-admin/doas
+        net-misc/openssh
+        # laptop hardware
+        sys-apps/acpid                    # lid switch, power button, brightness keys
+        app-power/power-profiles-daemon    # on battery vs plugged in
+        # firmware: L14 Gen 2 ships MT7921 (MediaTek) or Intel AX201
+        sys-firmware/linux-firmware
+        sys-firmware/intel-firmware
+        sys-firmware/mediatek-firmware
+        sys-firmware/sof-firmware          # Intel SoF audio
+        # odds and ends
+        app-misc/chrony                    # clock; TLS and logs need it right
+        app-editors/vim
+        dev-vcs/git
+        app-misc/pciutils
+        sys-apps/usbutils
+    )
+    if ((DRY_RUN)); then
+        plan "emerge --update --deep --newuse --autounmask-write @world"
+        plan "emerge --oneshot: ${pkgs[*]}"
+        return 0
+    fi
+    info "installing @world (binhost: ~20 min, source: hours)"
+    in_chroot "emerge --update --deep --newuse --autounmask-write @world" >/dev/null
+    info "installing the laptop package set"
+    in_chroot "emerge --oneshot --noreplace --newuse --autounmask-write ${pkgs[*]}" >/dev/null
+    ok "packages installed"
+}
+
+# ------------------------------------------------------------------- config ---
+base_config() {
+    if ((DRY_RUN)); then
+        plan "write /etc/hostname, /etc/hosts, /etc/fstab (label-based, TRIM weekly)"
+        return 0
+    fi
+    cat > "$TARGET/etc/hostname" <<EOF
+$HOSTNAME
+EOF
+    cat > "$TARGET/etc/hosts" <<EOF
+127.0.0.1   localhost
+127.0.1.1   $HOSTNAME
+::1         localhost ip6-localhost ip6-loopback
+EOF
+    # Referenced by label, so a change in disk enumeration order does not break
+    # booting. pass=2 would try to fsck vfat, which is meaningless.
+    cat > "$TARGET/etc/fstab" <<EOF
+# <file system>   <mount point>  <type>  <options>               <dump> <pass>
+LABEL=esp         /boot/efi       vfat   defaults,noatime        0      2
+$( [[ -n "$SWAP_SIZE" ]] && echo "LABEL=swap        none            swap   sw,noatime              0      0" )
+LABEL=root        /               ext4   defaults,noatime        0      1
+tmpfs             /tmp            tmpfs  rw,nosuid,nodev,size=2G  0      0
+EOF
+    sed -i '/^$/d' "$TARGET/etc/fstab"
+    mkdir -p "$TARGET/etc/conf.d"
+    cat > "$TARGET/etc/conf.d/fstrim" <<'EOF'
+# Periodic SSD TRIM, enabled by the localmount service.
+fstrim_enable="yes"
+EOF
+    ok "base configuration written"
+}
+
+make_user() {
+    if ((DRY_RUN)); then
+        plan "create user '$USERNAME' (wheel,audio,video,usb,plugdev) and set passwords"
+        plan "write /etc/doas.conf permitting wheel, and fix doas permissions"
+        return 0
+    fi
+    in_chroot "useradd -m -G wheel,audio,video,usb,plugdev -s /bin/bash '$USERNAME'" >/dev/null
+
+    # Write the password file on the host and chpasswd inside the chroot, so no
+    # password ever appears in this script's output or in a log.
+    local tmppw
+    tmppw=$(mktemp)
+    chmod 600 "$tmppw"
+    printf '%s:%s\n' "$USERNAME" "$PASSWORD" > "$tmppw"
+    printf 'root:%s\n' "$PASSWORD" >> "$tmppw"
+    cp "$tmppw" "$TARGET/tmp/.pw"
+    chmod 600 "$TARGET/tmp/.pw"
+    rm -f "$tmppw"
+    in_chroot "chpasswd < /tmp/.pw && rm -f /tmp/.pw" >/dev/null
+
+    # doas ships no config and reads /etc/doas.conf (NOT /etc/doas/doas.conf).
+    # It refuses to run if the file is group/other-writable, and the binary must
+    # stay setuid AND world-executable (4750 makes it unusable for everyone else).
+    cat > "$TARGET/etc/doas.conf" <<EOF
+# Written by install-gentoo.sh
+#
+# "persist" keeps the caller's environment (PATH, DISPLAY, XDG_*). Drop the
+# word for a stricter rule that resets the environment instead.
+permit persist :wheel
+EOF
+    chown 0:0 "$TARGET/etc/doas.conf"
+    chmod 0600 "$TARGET/etc/doas.conf"
+    if [[ -f "$TARGET/usr/bin/doas" ]]; then
+        chown 0:0 "$TARGET/usr/bin/doas"
+        chmod 4755 "$TARGET/usr/bin/doas"
+    fi
+    ok "user '$USERNAME' and doas configured"
+}
+
+openrc_services() {
+    in_chroot_script <<'EOS'
+# OpenRC runlevels
+rc-update add hostname boot
+rc-update add hwclock boot
+rc-update add syslog boot
+rc-update add bootmisc boot
+rc-update add sysfs boot
+rc-update add procfs boot
+rc-update add modules boot
+rc-update add urandom boot
+rc-update add localmount boot
+rc-update add device-mapper boot
+rc-update add dmesg boot
+rc-update add termencoding keymaps consolefont
+rc-update add net boot
+rc-update add mount-ro remount
+rc-update add root remount
+rc-update add NetworkManager default
+rc-update add sshd default
+rc-update add acpid default
+rc-update add power-profiles default
+rc-update add chronyd default
+EOS
+}
+
+network_config() {
+    in_chroot_script <<'EOS'
+# NetworkManager and Wi-Fi
+mkdir -p /etc/NetworkManager/conf.d
+cat > /etc/NetworkManager/conf.d/wifi-powersave.conf <<'CONF'
+[connection]
+# 2 = never powersave. Both mt7921e and iwlwifi can stall the link after a few
+# minutes with powersave on.
+wifi.powersave = 2
+CONF
+cat > /etc/modprobe.d/wifi-powersave.conf <<'CONF'
+# Intel AX200/AX201: same stall, and iwlwifi's default power_save=1 triggers it.
+options iwlwifi power_save=0 d0_timeout=100
+# MediaTek MT7921 (L14 Gen 2, types 20X1/20X2/20X5/20X6)
+options mt7921e power_save=0
+CONF
+# A hand-connect fallback if NetworkManager has not come up yet.
+mkdir -p /etc/wpa_supplicant
+chmod 700 /etc/wpa_supplicant
+cat > /etc/wpa_supplicant/wpa_supplicant.conf <<'CONF'
+# Fill this in on first boot if you need to connect without NetworkManager:
+#   wpa_passphrase "YOUR-SSID" >> /etc/wpa_supplicant/wpa_supplicant.conf
+# then chmod 600 the file and:  wpa_cli reconfigure
+country=US
+CONF
+chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+EOS
+}
+
+install_bootloader() {
+    in_chroot_script <<'EOS'
+# GRUB for UEFI
+grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Gentoo --recheck
+grub-mkconfig -o /boot/grub/grub.cfg
+EOS
+    ok "GRUB installed"
+}
+
+finalize() {
+    in_chroot_script <<'EOS'
+# Clean up the build environment
+# The installer set a resolver so Portage could reach the mirrors; NetworkManager
+# writes this file at runtime, so remove the copy we made.
+rm -f /etc/resolv.conf
+ecache clean --deep 2>/dev/null || true
+rm -rf /var/cache/portage/* 2>/dev/null || true
+rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
+EOS
+    if ((DRY_RUN)); then
+        plan "sync, unmount $TARGET, and remove the installer"
+        MOUNTED=0
+        return 0
+    fi
+    sync
+    info "unmounting $TARGET"
+    umount -R "$TARGET"
+    MOUNTED=0
+    ok "unmounted"
+}
+
+# -------------------------------------------------------------------- main ---
+confirm() {
+    ((DRY_RUN)) && return 0
+    ((ASSUME_YES)) && { warn "skipping confirmation (--yes)"; return 0; }
+    cat <<EOF
+
+$(printf '%s' "$C_RD")This ERASES every partition on $DISK.$(printf '%s' "$C_R")
+
+$(show_layout)
+$(printf '    Type the device path to continue: %s%s%s' "$C_B" "$DISK" "$C_R")
+EOF
+    local reply
+    read -r -p "    confirm> " reply
+    [[ "$reply" == "$DISK" ]] || die "aborted (nothing was changed)"
+}
+
+dry_run_report() {
+    cat <<EOF
+
+  plan
+  ----
+  partition : GPT on $DISK
+              esp ${ESP_SIZE} -> /boot/efi (vfat)
+              ${SWAP_SIZE:+swap ${SWAP_SIZE}; }root = remainder -> / (ext4)
+  stage3    : latest from the first reachable mirror
+  portage   : profile $PROFILE, $( ((USE_BINHOST)) && echo "binary packages (binhost)" || echo "source only, expect hours")
+  packages  : @world + kernel/grub/NetworkManager/wpa_supplicant/doas/openssh
+              + acpid/power-profiles/chrony + firmware + vim/git/pciutils/usbutils
+  services  : net + NetworkManager + sshd + acpid + power-profiles + chronyd
+  bootloader: grub-install --target=x86_64-efi
+  user      : $USERNAME (wheel,audio,video,usb,plugdev), root + $USERNAME share a password
+
+EOF
+    ok "dry run only; nothing on $DISK was touched"
+}
+
+main() {
+    local esp root
+
+    need_tools
+    if (( !DRY_RUN )); then
+        (( EUID == 0 )) || die "must run as root (try: sudo ./install-gentoo.sh)"
+        [[ -e /run/systemd/container ]] && die "running inside a container; this needs a real live system"
+    fi
+    check_uefi
+    check_secure_boot
+
+    if [[ -z "$DISK" ]]; then
+        ((AUTO_DISK)) || die "no target disk. Use --disk /dev/nvme0n1, or --auto."
+        DISK="$(auto_pick_disk)"
+    fi
+    if (( !DRY_RUN )); then
+        [[ -b "$DISK" ]] || die "$DISK is not a block device"
+        if lsblk -nrpo MOUNTPOINT "$DISK" 2>/dev/null | grep -q .; then
+            die "$DISK has a mounted partition. Unmount it first."
+        fi
+    fi
+
+    if [[ -z "$PASSWORD" ]]; then
+        if ((DRY_RUN)); then
+            PASSWORD="(prompted)"
+        else
+            local p2
+            read -r -s -p "  Password for $USERNAME and root: " PASSWORD; echo
+            [[ ${#PASSWORD} -ge 8 ]] || die "use at least 8 characters"
+            read -r -s -p "  Confirm: " p2; echo
+            [[ "$PASSWORD" == "$p2" ]] || die "passwords do not match"
+        fi
+    fi
+
+    printf '\n%sBarebones Gentoo install%s -> %s\n\n' "$C_B" "$C_R" "$DISK"
+    confirm
+    check_network
+    if ((DRY_RUN)); then
+        show_layout; echo
+        write_partitions
+        echo
+        dry_run_report
+        exit 0
+    fi
+
+    mkdir -p "$TARGET"
+    write_partitions
+    format_partitions
+    download_and_unpack          # before mounting /boot/efi and /dev
+    mount_targets
+    cp -L /etc/resolv.conf "$TARGET/etc/resolv.conf"
+
+    setup_portage
+    sync_portage
+    install_packages
+
+    base_config
+    make_user
+    openrc_services
+    network_config
+    install_bootloader
+    finalize
+
+    cat <<EOF
+
+$(printf '%s' "$C_G")Done.$(printf '%s' "$C_R")
+
+  hostname   : $HOSTNAME
+  user       : $USERNAME   (also the root password)
+  boot menu  : "Gentoo"
+  graphics   : none, console login on tty1
+
+On first boot:
+
+  nmcli device wifi list
+  nmcli device wifi connect "YOUR-SSID" --ask
+  ip -br a                       # find the address
+  ssh $USERNAME@<that-address>   # from your phone or another machine
+
+Then delete the installer so it cannot run twice:
+
+  rm -f $(realpath "$0")
+
+EOF
+}
+
+main "$@"
